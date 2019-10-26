@@ -1,43 +1,24 @@
 #include <EEPROM.h>
-
-// Downsampling by factor 2^4, Ts ~ 1.6ms (according to 10kHz measured)
-#define MEAN_SHIFT 4
-// Pin used to signal detection
-#define PIN_DETECT 10
-// First detection when difference between two downsampled samples is < DET_HL_THRESHOLD
-// (pos->neg)
-#define DET_HL_THRESHOLD -100
-// Timeout in samples while waiting for rise/fall
-#define DET_TIMEOUT 100
-// Maximum history. Must be high enough to capture samples from initial detection until
-// end of burst for learning mode to work.
-#define NHIST 150
+#include "learning.h"
+#include "defs.h"
+#include "crc.h"
 
 // Next detection when voltage has slowly risen by det_rising_threshold, then fallen by
 // det_falling_threshold
-static int16_t det_rising_threshold = 25;
-static int16_t det_falling_threshold = -22;
+int16_t det_rising_threshold = 25;
+int16_t det_falling_threshold = -22;
 
-// Sample delay line
-static int16_t adc_value_hist[NHIST];
-static int16_t ptr;
-// Default number of samples in delay line and number of samples we look back when
+// Number of samples in delay line and number of samples we look back when
 // detecting slow rise/fall.  Warning: Will read LARGEST_LOOKBACK samples after the
 // initial downward spike before starting to scan for rising slope, so must not be too
 // high. EVO measurements suggest first "real" rising slope is about 40 samples after the
 // spike.
-static int16_t lookback_rising = 15,
-    lookback_falling = 21;
-// Get largest of the two lookbacks
-#define LARGEST_LOOKBACK (lookback_rising > lookback_falling ? lookback_rising : lookback_falling)
+int16_t lookback_rising = 15;
+int16_t lookback_falling = 21;
 
-// Persist configuration locations
-#define EEPROM_ADDR_CRC 0
-#define EEPROM_ADDR_RT (EEPROM_ADDR_CRC+sizeof(unsigned long))
-#define EEPROM_ADDR_FT (EEPROM_ADDR_RT+sizeof(det_rising_threshold))
-#define EEPROM_ADDR_LR (EEPROM_ADDR_FT+sizeof(det_falling_threshold))
-#define EEPROM_ADDR_LF (EEPROM_ADDR_LR+sizeof(lookback_rising))
-#define EEPROM_ADDR_END (EEPROM_ADDR_LF+sizeof(lookback_falling))
+// Sample delay line
+static int16_t adc_value_hist[NHIST];
+static int16_t ptr;
 
 static volatile bool adc_ready = false; // new sample ready
 static volatile int16_t adc_value;      // the new sample
@@ -131,147 +112,6 @@ int16_t poll_sample() {
     return ret;
 }
 
-// Check whether data[ptr+i] is considered a local maximum (maxnmin=true) or minimum
-// (maxnmin=false).
-bool is_extrema(int i, int16_t ptr, int16_t *data, bool maxnmin, int16_t offset,
-                int16_t diffthr, int16_t *incr) {
-    if (maxnmin) {
-        // max is where voltage decreases "significantly" looking far ahead and decreases
-        // to some extent looking just a bit ahead
-        if ((data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] < -diffthr) &&
-            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+3)] < 0) &&
-            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+1)] < 0)) {
-            *incr = 2; // best guess, empirical
-            return true;
-        } else {
-            return false;
-        }
-    } else {
-        // min is where voltage increases "significantly" looking far ahead and decreases
-        // to some extent looking just a bit ahead
-        if ((data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] > diffthr) &&
-            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+3)] > 0) &&
-            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+1)] > 0)) {
-            *incr = 2; // best guess, empirical
-            return true;
-        } else {
-            return false;
-        }
-    }
-}
-
-bool learn(int16_t ptr, int16_t *data, uint16_t n) {
-    const int16_t offset = 10; // minimum time offset (in samples) between extrema
-    const int16_t diffthr = 10; // minimum voltage difference between extrema
-    int16_t incr;
-
-    // find the last minima (approx)
-    uint16_t last_min_idx = 0;
-    for (int i = n-1-offset; i >= 0; i--) {
-        if (data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] > diffthr) {
-            last_min_idx = i+offset;
-            break;
-        }
-    }
-
-    if (last_min_idx == 0) {
-        Serial.println("last_min not found");
-        return false;
-    }
-
-    // wind back to closest maxima
-    int16_t last_max = 0;
-    uint16_t last_max_idx = 0;
-    for (int i = last_min_idx-offset; i >= 0; i--) {
-        if (is_extrema(i, ptr, data, true, offset, diffthr, &incr)) {
-            last_max = data[idx_wraparound(ptr+i+offset+incr)];
-            last_max_idx = i+offset+incr;
-            break;
-        }
-    }
-
-    if (last_max_idx == 0) {
-        Serial.println("last_max not found");
-        return false;
-    }
-
-    // wind back to closest minima
-    int16_t mid_min = 0;
-    uint16_t mid_min_idx = 0;
-    for (int i = last_max_idx-offset; i >= 0; i--) {
-        if (is_extrema(i, ptr, data, false, offset, diffthr, &incr)) {
-            mid_min = data[idx_wraparound(ptr+i+offset+incr)];
-            mid_min_idx = i+offset+incr;
-            break;
-        }
-    }
-
-    if (mid_min_idx == 0) {
-        Serial.println("mid_min not found");
-        return false;
-    }
-
-    // wind back to closest maxima
-    int16_t first_max = 0;
-    uint16_t first_max_idx = 0;
-    for (int i = mid_min_idx-offset; i >= 0; i--) {
-        if (is_extrema(i, ptr, data, true, offset, diffthr, &incr)) {
-            first_max = data[idx_wraparound(ptr+i+offset+incr)];
-            first_max_idx = i+offset+incr;
-            break;
-        }
-    }
-
-    if (first_max_idx == 0) {
-        Serial.println("first_max not found");
-        return false;
-    }
-
-    // rise time in samples
-    uint16_t rise_tdiff = last_max_idx - mid_min_idx;
-    // fall time in samples
-    uint16_t fall_tdiff = mid_min_idx - first_max_idx;
-
-    if (rise_tdiff < offset || fall_tdiff < offset) {
-        Serial.println("rise tdiff/fall tdiff too small");
-        return false;
-    }
-
-    // difference in voltage when rising
-    int16_t rise_diff = last_max - mid_min;
-    // difference in voltage when falling
-    int16_t fall_diff = first_max - mid_min;
-
-    if (rise_diff <= 0 || fall_diff <= 0 || rise_diff <= diffthr || fall_diff < diffthr) {
-        Serial.println("rise/fall diff too small");
-        return false;
-    }
-
-    lookback_rising = rise_tdiff;
-    lookback_falling = fall_tdiff;
-    det_rising_threshold = (int16_t)(rise_diff*0.6);
-    det_falling_threshold = (int16_t)(-fall_diff*0.6);
-
-    Serial.print("lookback_rising: ");
-    Serial.println(lookback_rising);
-    Serial.print("lookback_falling: ");
-    Serial.println(lookback_falling);
-    Serial.print("det_rising_threshold: ");
-    Serial.println(det_rising_threshold);
-    Serial.print("det_falling_threshold: ");
-    Serial.println(det_falling_threshold);
-
-    // Save configuration to EEPROM
-    EEPROM.put(EEPROM_ADDR_RT, det_rising_threshold);
-    EEPROM.put(EEPROM_ADDR_FT, det_falling_threshold);
-    EEPROM.put(EEPROM_ADDR_LR, lookback_rising);
-    EEPROM.put(EEPROM_ADDR_LF, lookback_falling);
-    unsigned long crc = eeprom_crc();
-    EEPROM.put(EEPROM_ADDR_CRC, crc);
-
-    return true;
-}
-
 void detection() {
     digitalWrite(PIN_DETECT, LOW);
     // TODO: timer with interrupt to clear the pin would be clever, here
@@ -279,17 +119,6 @@ void detection() {
     delayMicroseconds(500);
     digitalWrite(PIN_DETECT, HIGH);
     ndet++;
-}
-
-// Handle delay line pointer wraparound, assuming idx is never more than nlookback off
-static inline int16_t idx_wraparound(int16_t idx) {
-    if (idx < 0) {
-        return idx + NHIST;
-    } else if (idx >= NHIST) {
-        return idx - NHIST;
-    } else {
-        return idx;
-    }
 }
 
 void loop() {
@@ -306,6 +135,10 @@ void loop() {
             learning_mode = true;
             first = true;
             ptr = 0;
+        } else if (in == 'c') {
+            Serial.println("Clearing config CRC");
+            for (unsigned int i = 0; i < sizeof(unsigned long); i++)
+                EEPROM.write(EEPROM_ADDR_CRC+i, 0);
         }
     }
 
@@ -400,26 +233,6 @@ void loop() {
         }
 
     }
-}
-
-// https://www.arduino.cc/en/Tutorial/EEPROMCrc
-unsigned long eeprom_crc(void) {
-
-  const unsigned long crc_table[16] = {
-    0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
-    0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
-    0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
-    0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
-  };
-
-  unsigned long crc = ~0L;
-
-  for (unsigned int index = (EEPROM_ADDR_CRC+sizeof(unsigned long)); index < EEPROM_ADDR_END; ++index) {
-    crc = crc_table[(crc ^ EEPROM[index]) & 0x0f] ^ (crc >> 4);
-    crc = crc_table[(crc ^ (EEPROM[index] >> 4)) & 0x0f] ^ (crc >> 4);
-    crc = ~crc;
-  }
-  return crc;
 }
 
 // Local Variables:

@@ -104,7 +104,7 @@ void setup() {
 }
 
 int16_t poll_sample() {
-    // Turn on LED if we every loose a sample - except the first sample after running
+    // Turn on LED if we ever loose a sample - except the first sample after running
     // learning routine (expected loss).
     if (adc_ready && !first_sample_after_learning) {
         PORTB |= (1 << 5);
@@ -122,8 +122,6 @@ int16_t poll_sample() {
 
 void detection() {
     digitalWrite(PIN_DETECT, LOW);
-    // TODO: timer with interrupt to clear the pin would be clever, here
-    // not so critical with this low sample rate tho... longer pulse needed?
     delayMicroseconds(500);
     digitalWrite(PIN_DETECT, HIGH);
     ndet++;

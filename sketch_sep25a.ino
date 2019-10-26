@@ -1,3 +1,5 @@
+#include <EEPROM.h>
+
 // Downsampling by factor 2^4, Ts ~ 1.6ms (according to 10kHz measured)
 #define MEAN_SHIFT 4
 // Pin used to signal detection
@@ -28,6 +30,14 @@ static int16_t lookback_rising = 15,
     lookback_falling = 21;
 // Get largest of the two lookbacks
 #define LARGEST_LOOKBACK (lookback_rising > lookback_falling ? lookback_rising : lookback_falling)
+
+// Persist configuration locations
+#define EEPROM_ADDR_CRC 0
+#define EEPROM_ADDR_RT (EEPROM_ADDR_CRC+sizeof(unsigned long))
+#define EEPROM_ADDR_FT (EEPROM_ADDR_RT+sizeof(det_rising_threshold))
+#define EEPROM_ADDR_LR (EEPROM_ADDR_FT+sizeof(det_falling_threshold))
+#define EEPROM_ADDR_LF (EEPROM_ADDR_LR+sizeof(lookback_rising))
+#define EEPROM_ADDR_END (EEPROM_ADDR_LF+sizeof(lookback_falling))
 
 static volatile bool adc_ready = false; // new sample ready
 static volatile int16_t adc_value;      // the new sample
@@ -66,6 +76,19 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(PIN_DETECT, OUTPUT);
     digitalWrite(PIN_DETECT, HIGH);
+
+    unsigned long crc = eeprom_crc();
+    unsigned long crc_rd;
+    EEPROM.get(EEPROM_ADDR_CRC, crc_rd);
+    if (crc_rd == crc) {
+        Serial.println("CRC OK, loading config");
+        EEPROM.get(EEPROM_ADDR_RT, det_rising_threshold);
+        EEPROM.get(EEPROM_ADDR_FT, det_falling_threshold);
+        EEPROM.get(EEPROM_ADDR_LR, lookback_rising);
+        EEPROM.get(EEPROM_ADDR_LF, lookback_falling);
+    } else {
+        Serial.println("Invalid CRC, using defaults");
+    }
 
     // initial state
     state = STATE_IDLE;
@@ -238,6 +261,14 @@ bool learn(int16_t ptr, int16_t *data, uint16_t n) {
     Serial.print("det_falling_threshold: ");
     Serial.println(det_falling_threshold);
 
+    // Save configuration to EEPROM
+    EEPROM.put(EEPROM_ADDR_RT, det_rising_threshold);
+    EEPROM.put(EEPROM_ADDR_FT, det_falling_threshold);
+    EEPROM.put(EEPROM_ADDR_LR, lookback_rising);
+    EEPROM.put(EEPROM_ADDR_LF, lookback_falling);
+    unsigned long crc = eeprom_crc();
+    EEPROM.put(EEPROM_ADDR_CRC, crc);
+
     return true;
 }
 
@@ -369,6 +400,26 @@ void loop() {
         }
 
     }
+}
+
+// https://www.arduino.cc/en/Tutorial/EEPROMCrc
+unsigned long eeprom_crc(void) {
+
+  const unsigned long crc_table[16] = {
+    0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+    0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+    0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+    0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+  };
+
+  unsigned long crc = ~0L;
+
+  for (unsigned int index = (EEPROM_ADDR_CRC+sizeof(unsigned long)); index < EEPROM_ADDR_END; ++index) {
+    crc = crc_table[(crc ^ EEPROM[index]) & 0x0f] ^ (crc >> 4);
+    crc = crc_table[(crc ^ (EEPROM[index] >> 4)) & 0x0f] ^ (crc >> 4);
+    crc = ~crc;
+  }
+  return crc;
 }
 
 // Local Variables:

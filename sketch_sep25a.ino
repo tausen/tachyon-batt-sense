@@ -7,24 +7,25 @@
 #define DET_HL_THRESHOLD -100
 // Timeout in samples while waiting for rise/fall
 #define DET_TIMEOUT 100
-// Default number of samples in delay line and number of samples we look back when
-// detecting slow rise/fall.  Warning: Will read this many samples after the initial
-// downward spike before starting to scan for rising slope, so must not be too high. First
-// "real" rising slope is about 40 samples after the spike.
-#define DEFAULT_NLOOKBACK 15
-// Maximum history
+// Maximum history. Must be high enough to capture samples from initial detection until
+// end of burst for learning mode to work.
 #define NHIST 150
 
 // Next detection when voltage has slowly risen by det_rising_threshold, then fallen by
 // det_falling_threshold
-static int16_t det_rising_threshold = 20;
-static int16_t det_falling_threshold = -20;
+static int16_t det_rising_threshold = 25;
+static int16_t det_falling_threshold = -22;
 
 // Sample delay line
 static int16_t adc_value_hist[NHIST];
 static int16_t ptr;
-static int16_t lookback_rising = DEFAULT_NLOOKBACK,
-    lookback_falling = DEFAULT_NLOOKBACK;
+// Default number of samples in delay line and number of samples we look back when
+// detecting slow rise/fall.  Warning: Will read LARGEST_LOOKBACK samples after the
+// initial downward spike before starting to scan for rising slope, so must not be too
+// high. EVO measurements suggest first "real" rising slope is about 40 samples after the
+// spike.
+static int16_t lookback_rising = 15,
+    lookback_falling = 21;
 // Get largest of the two lookbacks
 #define LARGEST_LOOKBACK (lookback_rising > lookback_falling ? lookback_rising : lookback_falling)
 
@@ -41,8 +42,9 @@ enum state_t {STATE_IDLE, // waiting for first sudden voltage drop
               STATE_DETECTING_FALLING}; // waiting for slow drop in voltage
 static state_t state, state_prev; // current and previous state of state machine
 static uint16_t ndet = 0; // total number of detections
+static bool first_sample_after_learning = false;
 
-// ADC interrupt service routine
+// ADC interrupt service routine. Handles decimation.
 ISR(ADC_vect)
 {
     static uint32_t mean = 0;
@@ -69,8 +71,8 @@ void setup() {
     state = STATE_IDLE;
     state_prev = STATE_IDLE;
 
-    // Set ADC prescaler to 128 => 125KHz sample rate @ 16MHz clk
-    // update: Measured to around 10kHz sample rate (9.6kHz, actually) with adalm2k
+    // With these settings, sample rate is measured to around 10kHz (9.6kHz?) with
+    // ADALM2000
     ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
     // Use AVcc as ref
     ADMUX = (1 << REFS0);
@@ -90,9 +92,14 @@ void setup() {
 }
 
 int16_t poll_sample() {
-    PORTB |= (1 << 5); // debug pin - is high while program idle
+    // Turn on LED if we every loose a sample - except the first sample after running
+    // learning routine (expected loss).
+    if (adc_ready && !first_sample_after_learning) {
+        PORTB |= (1 << 5);
+    }
+    // PORTB |= (1 << 5); // debug pin - is high while program idle
     while (!adc_ready) { } // poll until sample ready
-    PORTB &= ~(1 << 5);
+    // PORTB &= ~(1 << 5);
     cli();
     int16_t ret = adc_value;
     adc_ready = false;
@@ -101,11 +108,144 @@ int16_t poll_sample() {
     return ret;
 }
 
+// Check whether data[ptr+i] is considered a local maximum (maxnmin=true) or minimum
+// (maxnmin=false).
+bool is_extrema(int i, int16_t ptr, int16_t *data, bool maxnmin, int16_t offset,
+                int16_t diffthr, int16_t *incr) {
+    if (maxnmin) {
+        // max is where voltage decreases "significantly" looking far ahead and decreases
+        // to some extent looking just a bit ahead
+        if ((data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] < -diffthr) &&
+            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+3)] < 0) &&
+            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+1)] < 0)) {
+            *incr = 2; // best guess, empirical
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        // min is where voltage increases "significantly" looking far ahead and decreases
+        // to some extent looking just a bit ahead
+        if ((data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] > diffthr) &&
+            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+3)] > 0) &&
+            (data[idx_wraparound(ptr+i+offset)] - data[idx_wraparound(ptr+i+offset+1)] > 0)) {
+            *incr = 2; // best guess, empirical
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+bool learn(int16_t ptr, int16_t *data, uint16_t n) {
+    const int16_t offset = 10; // minimum time offset (in samples) between extrema
+    const int16_t diffthr = 10; // minimum voltage difference between extrema
+    int16_t incr;
+
+    // find the last minima (approx)
+    uint16_t last_min_idx = 0;
+    for (int i = n-1-offset; i >= 0; i--) {
+        if (data[idx_wraparound(ptr+i)] - data[idx_wraparound(ptr+i+offset)] > diffthr) {
+            last_min_idx = i+offset;
+            break;
+        }
+    }
+
+    if (last_min_idx == 0) {
+        Serial.println("last_min not found");
+        return false;
+    }
+
+    // wind back to closest maxima
+    int16_t last_max = 0;
+    uint16_t last_max_idx = 0;
+    for (int i = last_min_idx-offset; i >= 0; i--) {
+        if (is_extrema(i, ptr, data, true, offset, diffthr, &incr)) {
+            last_max = data[idx_wraparound(ptr+i+offset+incr)];
+            last_max_idx = i+offset+incr;
+            break;
+        }
+    }
+
+    if (last_max_idx == 0) {
+        Serial.println("last_max not found");
+        return false;
+    }
+
+    // wind back to closest minima
+    int16_t mid_min = 0;
+    uint16_t mid_min_idx = 0;
+    for (int i = last_max_idx-offset; i >= 0; i--) {
+        if (is_extrema(i, ptr, data, false, offset, diffthr, &incr)) {
+            mid_min = data[idx_wraparound(ptr+i+offset+incr)];
+            mid_min_idx = i+offset+incr;
+            break;
+        }
+    }
+
+    if (mid_min_idx == 0) {
+        Serial.println("mid_min not found");
+        return false;
+    }
+
+    // wind back to closest maxima
+    int16_t first_max = 0;
+    uint16_t first_max_idx = 0;
+    for (int i = mid_min_idx-offset; i >= 0; i--) {
+        if (is_extrema(i, ptr, data, true, offset, diffthr, &incr)) {
+            first_max = data[idx_wraparound(ptr+i+offset+incr)];
+            first_max_idx = i+offset+incr;
+            break;
+        }
+    }
+
+    if (first_max_idx == 0) {
+        Serial.println("first_max not found");
+        return false;
+    }
+
+    // rise time in samples
+    uint16_t rise_tdiff = last_max_idx - mid_min_idx;
+    // fall time in samples
+    uint16_t fall_tdiff = mid_min_idx - first_max_idx;
+
+    if (rise_tdiff < offset || fall_tdiff < offset) {
+        Serial.println("rise tdiff/fall tdiff too small");
+        return false;
+    }
+
+    // difference in voltage when rising
+    int16_t rise_diff = last_max - mid_min;
+    // difference in voltage when falling
+    int16_t fall_diff = first_max - mid_min;
+
+    if (rise_diff <= 0 || fall_diff <= 0 || rise_diff <= diffthr || fall_diff < diffthr) {
+        Serial.println("rise/fall diff too small");
+        return false;
+    }
+
+    lookback_rising = rise_tdiff;
+    lookback_falling = fall_tdiff;
+    det_rising_threshold = (int16_t)(rise_diff*0.6);
+    det_falling_threshold = (int16_t)(-fall_diff*0.6);
+
+    Serial.print("lookback_rising: ");
+    Serial.println(lookback_rising);
+    Serial.print("lookback_falling: ");
+    Serial.println(lookback_falling);
+    Serial.print("det_rising_threshold: ");
+    Serial.println(det_rising_threshold);
+    Serial.print("det_falling_threshold: ");
+    Serial.println(det_falling_threshold);
+
+    return true;
+}
+
 void detection() {
     digitalWrite(PIN_DETECT, LOW);
     // TODO: timer with interrupt to clear the pin would be clever, here
     // not so critical with this low sample rate tho... longer pulse needed?
-    delayMicroseconds(100);
+    delayMicroseconds(500);
     digitalWrite(PIN_DETECT, HIGH);
     ndet++;
 }
@@ -183,7 +323,10 @@ void loop() {
                         Serial.print(",");
                 }
                 Serial.println("]");
+                // then attempt to guess some good thresholds
+                learn(ptr, adc_value_hist, NHIST);
                 // then reset and return to idle
+                first_sample_after_learning = true;
                 learning_mode = false;
                 ptr = 0;
                 first = true;
@@ -227,3 +370,7 @@ void loop() {
 
     }
 }
+
+// Local Variables:
+// mode: c++
+// End:

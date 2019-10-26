@@ -67,6 +67,14 @@ void setup() {
         EEPROM.get(EEPROM_ADDR_FT, det_falling_threshold);
         EEPROM.get(EEPROM_ADDR_LR, lookback_rising);
         EEPROM.get(EEPROM_ADDR_LF, lookback_falling);
+        Serial.print("lookback_rising: ");
+        Serial.println(lookback_rising);
+        Serial.print("lookback_falling: ");
+        Serial.println(lookback_falling);
+        Serial.print("det_rising_threshold: ");
+        Serial.println(det_rising_threshold);
+        Serial.print("det_falling_threshold: ");
+        Serial.println(det_falling_threshold);
     } else {
         Serial.println("Invalid CRC, using defaults");
     }

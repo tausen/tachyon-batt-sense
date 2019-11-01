@@ -1,20 +1,21 @@
-#include <EEPROM.h>
+#include "common.h"
 #include "learning.h"
-#include "defs.h"
-#include "crc.h"
+#include "eeprom_profile.h"
 
-// Next detection when voltage has slowly risen by det_rising_threshold, then fallen by
-// det_falling_threshold
-int16_t det_rising_threshold = 25;
-int16_t det_falling_threshold = -22;
+// Profile holding detection thresholds
+profile_t profile;
 
-// Number of samples in delay line and number of samples we look back when
-// detecting slow rise/fall.  Warning: Will read LARGEST_LOOKBACK samples after the
-// initial downward spike before starting to scan for rising slope, so must not be too
-// high. EVO measurements suggest first "real" rising slope is about 40 samples after the
-// spike.
-int16_t lookback_rising = 15;
-int16_t lookback_falling = 21;
+// Downsampling by factor 2^4, Ts ~ 1.6ms (according to 10kHz measured)
+#define MEAN_SHIFT 4
+// Pin used to signal detection
+#define PIN_DETECT 10
+// First detection when difference between two downsampled samples is < DET_HL_THRESHOLD
+// (pos->neg)
+#define DET_HL_THRESHOLD -100
+// Timeout in samples while waiting for rise/fall
+#define DET_TIMEOUT 100
+// Get largest of the two lookbacks
+#define LARGEST_LOOKBACK (profile.lookback_rising > profile.lookback_falling ? profile.lookback_rising : profile.lookback_falling)
 
 // Sample delay line
 static int16_t adc_value_hist[NHIST];
@@ -58,25 +59,24 @@ void setup() {
     pinMode(PIN_DETECT, OUTPUT);
     digitalWrite(PIN_DETECT, HIGH);
 
-    unsigned long crc = eeprom_crc();
-    unsigned long crc_rd;
-    EEPROM.get(EEPROM_ADDR_CRC, crc_rd);
-    if (crc_rd == crc) {
+    if (eeprom_check_crc()) {
         Serial.println("CRC OK, loading config");
-        EEPROM.get(EEPROM_ADDR_RT, det_rising_threshold);
-        EEPROM.get(EEPROM_ADDR_FT, det_falling_threshold);
-        EEPROM.get(EEPROM_ADDR_LR, lookback_rising);
-        EEPROM.get(EEPROM_ADDR_LF, lookback_falling);
+        eeprom_load(&profile);
         Serial.print("lookback_rising: ");
-        Serial.println(lookback_rising);
+        Serial.println(profile.lookback_rising);
         Serial.print("lookback_falling: ");
-        Serial.println(lookback_falling);
+        Serial.println(profile.lookback_falling);
         Serial.print("det_rising_threshold: ");
-        Serial.println(det_rising_threshold);
+        Serial.println(profile.det_rising_threshold);
         Serial.print("det_falling_threshold: ");
-        Serial.println(det_falling_threshold);
+        Serial.println(profile.det_falling_threshold);
     } else {
         Serial.println("Invalid CRC, using defaults");
+        // Some sensible defaults
+        profile.det_rising_threshold = 25;
+        profile.det_falling_threshold = -22;
+        profile.lookback_rising = 15;
+        profile.lookback_falling = 21;
     }
 
     // initial state
@@ -143,8 +143,7 @@ void loop() {
             ptr = 0;
         } else if (in == 'c') {
             Serial.println("Clearing config CRC");
-            for (unsigned int i = 0; i < sizeof(unsigned long); i++)
-                EEPROM.write(EEPROM_ADDR_CRC+i, 0);
+            eeprom_clear();
         }
     }
 
@@ -185,7 +184,7 @@ void loop() {
                 // start looking for a rising slope now
                 state = STATE_DETECTING_RISING;
             } else {
-                // in learning mode, just print all the samples instead
+                // in learning mode, start by printing all the samples
                 Serial.print("[");
                 for (unsigned int i = 0; i < NHIST; i++) {
                     Serial.print(adc_value_hist[idx_wraparound(ptr+i)]);
@@ -194,7 +193,10 @@ void loop() {
                 }
                 Serial.println("]");
                 // then attempt to guess some good thresholds
-                learn(ptr, adc_value_hist, NHIST);
+                if (learn(ptr, adc_value_hist, NHIST, &profile)) {
+                    // if that seems to go well, save the profile
+                    eeprom_save(&profile);
+                }
                 // then reset and return to idle
                 first_sample_after_learning = true;
                 learning_mode = false;
@@ -209,12 +211,13 @@ void loop() {
         int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
 
         // The sample from lookback_rising samples ago
-        int16_t then = adc_value_hist[idx_wraparound(ptr-lookback_rising)];
+        int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_rising)];
 
-        // Waiting for significant rise in voltage between <now> and NHIST samples ago.
-        // This should either be the initial voltage rise where battery voltage settles
-        // to its nominal voltage (motor still running) or when the piston is released.
-        if ((now - then) > det_rising_threshold) {
+        // Waiting for significant rise in voltage between <now> and lookback_rising
+        // samples ago. This should either be the initial voltage rise where battery
+        // voltage settles to its nominal voltage (motor still running) or when the piston
+        // is released.
+        if ((now - then) > profile.det_rising_threshold) {
             state = STATE_DETECTING_FALLING;
         } else if (n_samples_in_state > DET_TIMEOUT) {
             // Timeout waiting for rising - go back to idle
@@ -226,11 +229,11 @@ void loop() {
         int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
 
         // The sample from lookback_falling samples ago
-        int16_t then = adc_value_hist[idx_wraparound(ptr-lookback_falling)];
+        int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_falling)];
 
-        // Waiting for significant drop in voltage between <now> and NHIST samples ago.
-        // This should be when the gears are drawing back the piston again.
-        if ((now - then) < det_falling_threshold) {
+        // Waiting for significant drop in voltage between <now> and lookback_falling
+        // samples ago. This should be when the gears are drawing back the piston again.
+        if ((now - then) < profile.det_falling_threshold) {
             detection(); // trigger detection
             state = STATE_DETECTING_RISING;
         } else if (n_samples_in_state > DET_TIMEOUT) {

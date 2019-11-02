@@ -9,6 +9,8 @@ profile_t profile;
 #define MEAN_SHIFT 4
 // Pin used to signal detection
 #define PIN_DETECT 10
+// Pin used for button (pulled up internally)
+#define PIN_BTN 2
 // First detection when difference between two downsampled samples is < DET_HL_THRESHOLD
 // (pos->neg)
 #define DET_HL_THRESHOLD -100
@@ -57,6 +59,7 @@ void setup() {
     Serial.begin(500000);
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(PIN_DETECT, OUTPUT);
+    pinMode(PIN_BTN, INPUT_PULLUP);
     digitalWrite(PIN_DETECT, HIGH);
 
     if (eeprom_check_crc()) {
@@ -127,6 +130,21 @@ void detection() {
     ndet++;
 }
 
+void blink() {
+    PORTB |= (1 << 5);
+    delay(100);
+    PORTB &= ~(1 << 5);
+    delay(100);
+}
+
+void start_learning_mode() {
+    // Start learning mode, starting by flushing the delay line
+    Serial.println("Learning");
+    learning_mode = true;
+    first = true;
+    ptr = 0;
+}
+
 void loop() {
     if (Serial.available() > 0) {
         char in = Serial.read();
@@ -136,15 +154,17 @@ void loop() {
         Serial.print(",");
         Serial.println(n_samples_in_state);
 
-        if (in == 'l') {
-            // Start learning mode, starting by flushing the delay line
-            learning_mode = true;
-            first = true;
-            ptr = 0;
-        } else if (in == 'c') {
+        if (in == 'l') {  // press l for learning mode
+            start_learning_mode();
+        } else if (in == 'c') {  // press c to clear profile
             Serial.println("Clearing config CRC");
             eeprom_clear();
         }
+    }
+
+    // Start learning mode when button pressed
+    if (!learning_mode && !digitalRead(PIN_BTN)) {
+        start_learning_mode();
     }
 
     // Poll until sample ready and manage delayline ptr
@@ -196,6 +216,13 @@ void loop() {
                 if (learn(ptr, adc_value_hist, NHIST, &profile)) {
                     // if that seems to go well, save the profile
                     eeprom_save(&profile);
+                    // and blink twice
+                    for (int i = 0; i < 2; i++)
+                        blink();
+                } else {
+                    // blink thrice to indicate failure
+                    for (int i = 0; i < 3; i++)
+                        blink();
                 }
                 // then reset and return to idle
                 first_sample_after_learning = true;

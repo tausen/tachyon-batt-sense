@@ -120,6 +120,9 @@ int16_t poll_sample() {
     adc_ready = false;
     sei();
 
+    // Clear flag if it was set
+    first_sample_after_learning = false;
+
     return ret;
 }
 

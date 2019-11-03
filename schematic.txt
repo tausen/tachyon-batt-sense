@@ -17,8 +17,8 @@
                    │  ____     │            ┴
         VBATT+ ────┴─┤____├──┬─┘
         VBATT- ───┐    R1    │
- (from battery)   ┴         ┌┴┐
+ (from battery)   ┴   15k   ┌┴┐
                             │ │ R2
-                            └┬┘
+                            └┬┘ 10k
                              │
                              ┴

@@ -255,36 +255,42 @@ void loop() {
         }
 
     } else if (state == STATE_DETECTING_RISING) {
-        // Newest sample
-        int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
+        if (n_samples_in_state >= profile.lookback_rising/2) {
+            // Newest sample
+            int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
 
-        // The sample from lookback_rising samples ago
-        int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_rising)];
+            // The sample from lookback_rising samples ago
+            int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_rising)];
 
-        // Waiting for significant rise in voltage between <now> and lookback_rising
-        // samples ago. This should either be the initial voltage rise where battery
-        // voltage settles to its nominal voltage (motor still running) or when the piston
-        // is released.
-        if ((now - then) > profile.det_rising_threshold) {
-            state = STATE_DETECTING_FALLING;
-        } else if (n_samples_in_state > DET_TIMEOUT) {
+            // Waiting for significant rise in voltage between <now> and lookback_rising
+            // samples ago. This should either be the initial voltage rise where battery
+            // voltage settles to its nominal voltage (motor still running) or when the piston
+            // is released.
+            if ((now - then) > profile.det_rising_threshold) {
+                state = STATE_DETECTING_FALLING;
+            }
+        }
+        if (n_samples_in_state > DET_TIMEOUT) {
             // Timeout waiting for rising - go back to idle
             state = STATE_IDLE;
         }
 
     } else if (state == STATE_DETECTING_FALLING) {
-        // Newest sample
-        int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
+        if (n_samples_in_state >= profile.lookback_falling/2) {
+            // Newest sample
+            int16_t now = adc_value_hist[idx_wraparound(ptr-1)];
 
-        // The sample from lookback_falling samples ago
-        int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_falling)];
+            // The sample from lookback_falling samples ago
+            int16_t then = adc_value_hist[idx_wraparound(ptr-profile.lookback_falling)];
 
-        // Waiting for significant drop in voltage between <now> and lookback_falling
-        // samples ago. This should be when the gears are drawing back the piston again.
-        if ((now - then) < profile.det_falling_threshold) {
-            detection(); // trigger detection
-            state = STATE_DETECTING_RISING;
-        } else if (n_samples_in_state > DET_TIMEOUT) {
+            // Waiting for significant drop in voltage between <now> and lookback_falling
+            // samples ago. This should be when the gears are drawing back the piston again.
+            if ((now - then) < profile.det_falling_threshold) {
+                detection(); // trigger detection
+                state = STATE_DETECTING_RISING;
+            }
+        }
+        if (n_samples_in_state > DET_TIMEOUT) {
             // Timeout waiting for falling - go back to idle
             state = STATE_IDLE;
         }

@@ -1,8 +1,16 @@
 #include <stdint.h>
 
+// Define this to increase history length and log entire history to UART after a detection
+// and return to idle
+// #define DEBUG
+
 // Maximum history. Must be high enough to capture samples from initial detection until
 // end of burst for learning mode to work.
+#ifdef DEBUG
+#define NHIST 400
+#else
 #define NHIST 150
+#endif
 
 typedef struct {
     // Next detection when voltage has slowly risen by det_rising_threshold, then fallen by

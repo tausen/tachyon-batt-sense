@@ -37,6 +37,7 @@ enum state_t {STATE_IDLE, // waiting for first sudden voltage drop
 static state_t state, state_prev; // current and previous state of state machine
 static uint16_t ndet = 0; // total number of detections
 static bool first_sample_after_learning = false;
+static bool do_debug = false; // do debug logging, only used if DEBUG is defined in common.h
 
 // ADC interrupt service routine. Handles decimation.
 ISR(ADC_vect)
@@ -200,12 +201,29 @@ void loop() {
             state = STATE_FILL_DELAYLINE;
         }
 
+#ifdef DEBUG
+        if (do_debug) {
+            Serial.print("[");
+            for (unsigned int i = 0; i < NHIST; i++) {
+                Serial.print(adc_value_hist[idx_wraparound(ptr+i)]);
+                if (i != NHIST-1)
+                    Serial.print(",");
+            }
+            Serial.println("]");
+
+            do_debug = false;
+        }
+#endif
+
     } else if (state == STATE_FILL_DELAYLINE) {
         // Wait for delay line to fill...
         if ((int16_t)n_samples_in_state >= (learning_mode ? NHIST : LARGEST_LOOKBACK)) {
             if (!learning_mode) {
                 // start looking for a rising slope now
                 state = STATE_DETECTING_RISING;
+#ifdef DEBUG
+                do_debug = true;
+#endif
             } else {
                 // in learning mode, start by printing all the samples
                 Serial.print("[");
